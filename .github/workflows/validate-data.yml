@@ -1,0 +1,150 @@
+name: Validate data
+
+# Guards the coach's direct-to-main lane: user_data/coach/state.md, coach_notes.md,
+# user_data/ledger/challenge_v2.json, and user_data/activities/workout_plans/sessions/** are committed to main without a PR (see
+# SOUL.md §2). challenge_v2.json and sessions/*.json are consumed by the
+# dashboard build (ui/scripts/build-data.mjs) and the quest-log generator, so a
+# malformed file would break the Vercel deploy unreviewed. This check catches
+# that fast — on the direct push to main, and on any PR that touches the data.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'user_data/ledger/challenge_v2.json'
+      - 'gen/widget_snapshots.json'
+      - 'user_data/activities/workout_plans/sessions/*.json'
+  pull_request:
+    paths:
+      - 'user_data/ledger/challenge_v2.json'
+      - 'gen/widget_snapshots.json'
+      - 'user_data/activities/workout_plans/sessions/*.json'
+
+jobs:
+  validate-json:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate JSON parses
+        run: |
+          python3 - <<'PY'
+          import glob, json, sys
+
+          files = ['user_data/ledger/challenge_v2.json'] + sorted(glob.glob('user_data/activities/workout_plans/sessions/*.json'))
+          bad = []
+          checked = 0
+          for f in files:
+              try:
+                  with open(f) as fh:
+                      json.load(fh)
+                  checked += 1
+              except FileNotFoundError:
+                  continue
+              except json.JSONDecodeError as e:
+                  bad.append(f"{f}: {e}")
+
+          if bad:
+              print("::error::Invalid JSON — a direct push to main with this would break the dashboard build:")
+              for b in bad:
+                  print(f"  - {b}")
+              sys.exit(1)
+          print(f"Validated {checked} JSON file(s) — all parse cleanly.")
+          PY
+
+      - name: Validate challenge_v2.json shape
+        run: |
+          python3 - <<'PY'
+          import json, sys
+
+          path = "user_data/ledger/challenge_v2.json"
+          try:
+              with open(path) as fh:
+                  data = json.load(fh)
+          except FileNotFoundError:
+              print(f"::notice::{path} not found — skipping shape check")
+              sys.exit(0)
+          except json.JSONDecodeError:
+              sys.exit(0)  # already caught by the JSON-parse step above
+
+          errors = []
+          if data.get("version") != 4:
+              errors.append(f"version must be 4 (ADR 0006), got {data.get('version')!r}")
+          if "challenge" in data:
+              errors.append("legacy top-level 'challenge' block found — use 'season' (v4)")
+          if "season" not in data:
+              errors.append("missing required 'season' block")
+          if "main_quest" not in data:
+              errors.append("missing required 'main_quest' block")
+          if "quests" not in data:
+              errors.append("missing required 'quests' list")
+
+          weekly_targets = data.get("weekly_targets")
+          if weekly_targets is not None:
+              bad_keys = [k for k, v in weekly_targets.items() if not isinstance(v, (int, float))]
+              if bad_keys:
+                  errors.append(
+                      f"weekly_targets must be plain numbers, not config objects: {', '.join(bad_keys)}"
+                  )
+
+          # The standard quest shape going forward (unified across skeleton/athlete repos):
+          # daily_streak + default_not_done, tracked via completed_dates + excused_dates - both
+          # arrays must be present (even empty) so a quest doesn't silently fall back to reading
+          # the wrong fields. This is the exact class of drift that caused Main Quest/side quests
+          # to render as zero on a live dashboard. default_done/missed_dates is still a valid
+          # polarity (generate_quest_log.py and the web dashboard both support it) - it needs
+          # missed_dates instead of completed_dates, excused_dates either way.
+          for i, q in enumerate(data.get("quests", []) or []):
+              if not isinstance(q, dict) or q.get("type") != "daily_streak":
+                  continue
+              prefix = f"quests[{i}] ({q.get('id', '?')})"
+              # default_not_done matches generate_quest_log.py/generate_quest_history.py/
+              # warmHomeSnapshots.ts/monthlyAnalyticsModel.ts's default for an absent polarity -
+              # this was the one file still disagreeing (defaulted to default_done), which would
+              # fail carve-skeleton.mjs's own scaffold (completed_dates+excused_dates, no
+              # missed_dates) against this exact check.
+              polarity = q.get("polarity", "default_not_done")
+              required_fields = ["excused_dates"]
+              required_fields.append("missed_dates" if polarity == "default_done" else "completed_dates")
+              for field in required_fields:
+                  value = q.get(field)
+                  if value is None:
+                      errors.append(f"{prefix} missing required field: {field} (use [] if empty)")
+                  elif not isinstance(value, list):
+                      errors.append(f"{prefix} {field} must be an array")
+
+          if errors:
+              print(f"::error::{path} does not match the canonical v4 schema:")
+              for e in errors:
+                  print(f"  - {e}")
+              sys.exit(1)
+          print(f"Validated {path} — v4 shape OK.")
+          PY
+
+      - name: Validate widget_snapshots.json
+        run: |
+          python3 - <<'PY'
+          import json, sys
+
+          path = "gen/widget_snapshots.json"
+          try:
+              with open(path) as fh:
+                  data = json.load(fh)
+          except FileNotFoundError:
+              print(f"::error::{path} not found")
+              sys.exit(1)
+          except json.JSONDecodeError as e:
+              print(f"::error::{path}: {e}")
+              sys.exit(1)
+
+          required = ("schema_version", "generated_at", "home")
+          missing = [k for k in required if k not in data]
+          if missing:
+              print(f"::error::{path} missing required keys: {', '.join(missing)}")
+              sys.exit(1)
+
+          if data["schema_version"] != 1:
+              print(f"::error::{path} schema_version must be 1, got {data['schema_version']!r}")
+              sys.exit(1)
+
+          print(f"Validated {path} — schema_version=1, required keys present.")
+          PY
