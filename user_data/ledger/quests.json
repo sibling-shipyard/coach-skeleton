@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "_meta": {
+    "updated_at": null,
+    "updated_by": "skeleton-init",
+    "trace_id": null
+  },
+  "weekly_targets": {},
+  "main_quest": {
+    "id": "main",
+    "name": "20 Strength Sessions",
+    "type": "count_target",
+    "target": 20,
+    "count_pattern": "^WeightTraining\\s*#"
+  },
+  "quests": []
+}

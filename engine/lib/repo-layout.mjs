@@ -16,10 +16,17 @@ export function repoRoot(fromDir = path.dirname(fileURLToPath(import.meta.url)))
     if (fs.existsSync(path.join(dir, "engine", "soul"))) {
       return dir;
     }
+    // Athlete repo: a composed SOUL at the propagated/ or repo root. Both the post-ADR-0022
+    // `SOUL.claude.md` name and the pre-split `SOUL.md` count — repos carved before the split
+    // still carry the old name and must keep resolving.
+    const hasAthleteBand =
+      fs.existsSync(path.join(dir, "user_data")) || fs.existsSync(path.join(dir, "training"));
     if (
+      fs.existsSync(path.join(dir, "propagated", "SOUL.claude.md")) ||
       fs.existsSync(path.join(dir, "propagated", "SOUL.md")) ||
-      (fs.existsSync(path.join(dir, "SOUL.md")) &&
-        (fs.existsSync(path.join(dir, "user_data")) || fs.existsSync(path.join(dir, "training"))))
+      ((fs.existsSync(path.join(dir, "SOUL.claude.md")) ||
+        fs.existsSync(path.join(dir, "SOUL.md"))) &&
+        hasAthleteBand)
     ) {
       return dir;
     }
@@ -106,10 +113,10 @@ export function templatesDir(repoRootPath) {
     : path.join(repoRootPath, "templates");
 }
 
-export function aggregatePath(repoRootPath) {
+export function dashboardSnapshotPath(repoRootPath) {
   return usesNewLayout(repoRootPath)
-    ? path.join(repoRootPath, "gen", "aggregate.json")
-    : path.join(repoRootPath, "data", "aggregate.json");
+    ? path.join(repoRootPath, "gen", "dashboard_snapshot.json")
+    : path.join(repoRootPath, "data", "dashboard_snapshot.json");
 }
 
 export function sleepLogPath(repoRootPath) {
@@ -128,12 +135,6 @@ export function syncStatusPath(repoRootPath) {
   return usesNewLayout(repoRootPath)
     ? path.join(repoRootPath, "gen", "sync_status.json")
     : path.join(repoRootPath, "training", "sync_status.json");
-}
-
-export function questLogPath(repoRootPath) {
-  return usesNewLayout(repoRootPath)
-    ? path.join(repoRootPath, "gen", "quest_log.md")
-    : path.join(repoRootPath, "training", "activities", "quest_log.md");
 }
 
 export function questHistoryPath(repoRootPath) {
@@ -170,13 +171,25 @@ export function activitiesDir(repoRootPath) {
     : path.join(repoRootPath, "training", "activities");
 }
 
-/** Composed SOUL path — HQ: platform/SOUL.md; athlete repos: propagated/SOUL.md. */
-export function soulFilePath(repoRootPath) {
+/**
+ * Composed SOUL path for a build target (ADR 0022) — HQ: platform/SOUL.<target>.md; athlete
+ * repos: propagated/SOUL.claude.md, then repo root.
+ *
+ * The bare `SOUL.md` name is retired at HQ but still probed last in athlete repos: `coach-akash`
+ * and `coach-skanda` were carved before the split and still carry `propagated/SOUL.md`, so
+ * dropping the fallback would break the engine scripts running inside them.
+ */
+export function soulFilePath(repoRootPath, target = "claude") {
   if (isHqMonorepo(repoRootPath)) {
-    const hq = path.join(repoRootPath, "platform", "SOUL.md");
-    if (fs.existsSync(hq)) return hq;
+    return path.join(repoRootPath, "platform", `SOUL.${target}.md`);
   }
-  const propagated = path.join(repoRootPath, "propagated", "SOUL.md");
-  if (fs.existsSync(propagated)) return propagated;
+  const candidates = [
+    path.join(repoRootPath, "propagated", `SOUL.${target}.md`),
+    path.join(repoRootPath, "propagated", "SOUL.md"),
+    path.join(repoRootPath, `SOUL.${target}.md`),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
   return path.join(repoRootPath, "SOUL.md");
 }

@@ -1,8 +1,9 @@
 # Setup — coach-<user> repo
 
-One checklist to go from fork to first coaching session. Budget ~10 minutes. This repo is a
-data/backing store for the hosted Coach Phelps web + iOS app — you never open a local coding
-tool against it; all coaching happens through the app.
+One checklist to go from fork to first coaching session. Budget ~10 minutes. Coaching normally
+happens through the hosted Coach Phelps web + iOS app — this repo is that app's data/backing
+store. Claude Code also boots as Coach directly in this repo (BYOB) if you want a terminal
+session instead; both paths read/write the same files.
 
 ---
 
@@ -38,9 +39,9 @@ your repo.
 
 ## 4. Open the Coach Phelps app
 
-Sign in on the web dashboard or the iOS app and connect this repo. Coach detects the blank
-Athlete Profile in `user_data/coach/state.md` and runs the First Session intake automatically
-the first time you open chat.
+Sign in on the web dashboard or the iOS app and connect this repo. Coach detects the empty
+`user_data/coach/profile.json` and runs the First Session intake automatically the first time
+you open chat.
 
 ---
 
@@ -49,9 +50,9 @@ the first time you open chat.
 Trigger the pipeline once so `gen/` is populated:
 
 1. **GitHub → Actions → Sync → Run workflow**, or
-2. Locally: `python3 engine/scripts/regenerate_derived.py` then `node engine/scripts/build-aggregate.mjs --aggregate`
+2. Locally: `python3 engine/scripts/regenerate_derived.py`, then run the dashboard snapshot and athlete insights generators.
 
-After sync, `gen/quest_log.md` and `gen/aggregate.json` reflect your challenge and any activity history.
+After sync, `gen/dashboard_snapshot.json` and `gen/athlete_insights.json` reflect your ledger and activity history.
 
 ---
 
