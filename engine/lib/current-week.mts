@@ -3,7 +3,11 @@ export const CURRENT_WEEK_SCHEMA_VERSION = 1 as const;
 export type CurrentWeekDataStatus = "placeholder" | "draft" | "live";
 export type CurrentWeekSessionOrigin = "planned" | "unplanned";
 export type CurrentWeekSessionPriority = "anchor" | "support" | "optional";
-export type CurrentWeekSessionStatus = "planned" | "done" | "skipped" | "cancelled";
+// "cancelled" dropped (workout-backend-wiring live verification, per direction): only three
+// states, matching how the athlete actually thinks about a day - planned, done, or skipped.
+// Every prior "cancelled" use already mapped to the same UI outcome as "skipped" client-side
+// (currentWeekAdapter.ts's mapStatus), so this is a pure simplification, not a behavior change.
+export type CurrentWeekSessionStatus = "planned" | "done" | "skipped";
 export type CoachTone = "positive" | "steady" | "caution" | "recovery";
 export type CoachConfidence = "low" | "medium" | "high";
 
@@ -11,8 +15,6 @@ export interface CurrentWeekRange {
   id: string;
   start_date: string;
   end_date: string;
-  phase_name: string | null;
-  block_name: string | null;
   focus: string | null;
   guardrails: string[];
 }
@@ -41,7 +43,25 @@ export interface CurrentWeekDay {
   sessions: CurrentWeekSession[];
 }
 
+// tone/confidence/evidence_refs dropped (part3-rollout): tone/confidence ask Coach for a
+// categorical judgment about its own writing when the prose itself already carries tone and
+// confidence (SOUL's voice design); evidence_refs asks Coach to self-assert what backs a claim
+// as topic strings when "what's the evidence" should be computed from real data instead.
+// valid_from/valid_until are kept - confirmed genuinely earning their place, a coach_read can
+// start partway through the week after a reset.
 export interface CoachRead {
+  headline: string;
+  body: string;
+  valid_from: string;
+  valid_until: string;
+}
+
+// coach_comments is a separate semantic-comment system from coach_read, out of this redesign's
+// reviewed scope - keeps its own tone/confidence/evidence_refs rather than extending the now
+// trimmed CoachRead.
+export interface CoachComment {
+  id: string;
+  topic: string;
   headline: string;
   body: string;
   tone: CoachTone;
@@ -49,11 +69,6 @@ export interface CoachRead {
   evidence_refs: string[];
   valid_from: string;
   valid_until: string;
-}
-
-export interface CoachComment extends CoachRead {
-  id: string;
-  topic: string;
 }
 
 export interface CurrentWeek {
@@ -66,6 +81,7 @@ export interface CurrentWeek {
   coach_comments: CoachComment[];
   updated_at: string;
   updated_by: string;
+  trace_id: string;
 }
 
 export type CurrentWeekAvailabilityStatus =
@@ -109,14 +125,13 @@ const ROOT_KEYS = [
   "coach_comments",
   "updated_at",
   "updated_by",
+  "trace_id",
 ] as const;
 
 const WEEK_KEYS = [
   "id",
   "start_date",
   "end_date",
-  "phase_name",
-  "block_name",
   "focus",
   "guardrails",
 ] as const;
@@ -143,6 +158,15 @@ const SESSION_KEYS = [
 const COACH_READ_KEYS = [
   "headline",
   "body",
+  "valid_from",
+  "valid_until",
+] as const;
+
+const COACH_COMMENT_KEYS = [
+  "id",
+  "topic",
+  "headline",
+  "body",
   "tone",
   "confidence",
   "evidence_refs",
@@ -150,12 +174,10 @@ const COACH_READ_KEYS = [
   "valid_until",
 ] as const;
 
-const COACH_COMMENT_KEYS = ["id", "topic", ...COACH_READ_KEYS] as const;
-
 const DATA_STATUSES: readonly CurrentWeekDataStatus[] = ["placeholder", "draft", "live"];
 const SESSION_ORIGINS: readonly CurrentWeekSessionOrigin[] = ["planned", "unplanned"];
 const SESSION_PRIORITIES: readonly CurrentWeekSessionPriority[] = ["anchor", "support", "optional"];
-const SESSION_STATUSES: readonly CurrentWeekSessionStatus[] = ["planned", "done", "skipped", "cancelled"];
+const SESSION_STATUSES: readonly CurrentWeekSessionStatus[] = ["planned", "done", "skipped"];
 const COACH_TONES: readonly CoachTone[] = ["positive", "steady", "caution", "recovery"];
 const COACH_CONFIDENCES: readonly CoachConfidence[] = ["low", "medium", "high"];
 
@@ -322,14 +344,6 @@ function validateCoachRead(value: unknown, path: string, issues: string[]): void
   validateKeys(value, COACH_READ_KEYS, path, issues);
   validateRequiredString(value.headline, `${path}.headline`, issues, 72);
   validateRequiredString(value.body, `${path}.body`, issues, 280);
-  validateEnum(value.tone, COACH_TONES, `${path}.tone`, issues);
-  validateEnum(value.confidence, COACH_CONFIDENCES, `${path}.confidence`, issues);
-  validateStringArray(value.evidence_refs, `${path}.evidence_refs`, issues, {
-    minItems: 1,
-    maxItems: 8,
-    maxItemLength: 64,
-    pattern: EVIDENCE_REF_PATTERN,
-  });
   validateCommentaryWindow(value, path, issues);
 }
 
@@ -493,8 +507,6 @@ function validateWeek(value: unknown, issues: string[]): { startDate: string | n
   const idValid = validateRequiredString(value.id, `${path}.id`, issues, 16);
   const startValid = validateDate(value.start_date, `${path}.start_date`, issues);
   const endValid = validateDate(value.end_date, `${path}.end_date`, issues);
-  validateNullableString(value.phase_name, `${path}.phase_name`, issues, 80);
-  validateNullableString(value.block_name, `${path}.block_name`, issues, 80);
   validateNullableString(value.focus, `${path}.focus`, issues, 160);
   validateStringArray(value.guardrails, `${path}.guardrails`, issues, {
     maxItems: 6,
@@ -619,6 +631,7 @@ export function parseCurrentWeek(input: unknown, now = new Date()): CurrentWeekR
     issues.push("current_week.updated_at must be an ISO 8601 timestamp with a timezone");
   }
   validateRequiredString(input.updated_by, "current_week.updated_by", issues, 64);
+  validateRequiredString(input.trace_id, "current_week.trace_id", issues, 64);
 
   if (dataStatusValid && input.data_status === "live" && input.coach_read === null) {
     issues.push("current_week.coach_read is required when data_status is live");
