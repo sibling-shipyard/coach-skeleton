@@ -1,0 +1,218 @@
+name: Validate data
+
+# Guards the coach's direct-to-main lane: user_data/coach/{profile,memory,injuries,coach_log}.json,
+# user_data/ledger/{seasons,quests,progress,progressions}.json, and
+# user_data/activities/workout_plans/sessions/** are committed to main without a PR (see
+# SOUL.claude.md §12). These are consumed by the dashboard build
+# (engine/scripts/build-dashboard-snapshot.mjs) and the athlete-insights generator, so a
+# malformed file would break the Vercel deploy unreviewed. This check catches that fast — on the
+# direct push to main, and on any PR that touches the data.
+#
+# Legacy user_data/ledger/challenge_v2.json is still checked too (backward compatible with any
+# repo not yet migrated to the split schema) — every check below no-ops (FileNotFoundError ->
+# skip) on whichever set of files a given repo doesn't have.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'user_data/coach/profile.json'
+      - 'user_data/coach/memory.json'
+      - 'user_data/coach/injuries.json'
+      - 'user_data/coach/coach_log.json'
+      - 'user_data/ledger/seasons.json'
+      - 'user_data/ledger/quests.json'
+      - 'user_data/ledger/progress.json'
+      - 'user_data/ledger/progressions.json'
+      - 'user_data/ledger/challenge_v2.json'
+      - 'gen/widget_snapshots.json'
+      - 'user_data/activities/workout_plans/sessions/*.json'
+  pull_request:
+    paths:
+      - 'user_data/coach/profile.json'
+      - 'user_data/coach/memory.json'
+      - 'user_data/coach/injuries.json'
+      - 'user_data/coach/coach_log.json'
+      - 'user_data/ledger/seasons.json'
+      - 'user_data/ledger/quests.json'
+      - 'user_data/ledger/progress.json'
+      - 'user_data/ledger/progressions.json'
+      - 'user_data/ledger/challenge_v2.json'
+      - 'gen/widget_snapshots.json'
+      - 'user_data/activities/workout_plans/sessions/*.json'
+
+jobs:
+  validate-json:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate JSON parses
+        run: |
+          python3 - <<'PY'
+          import glob, json, sys
+
+          files = [
+              'user_data/coach/profile.json',
+              'user_data/coach/memory.json',
+              'user_data/coach/injuries.json',
+              'user_data/coach/coach_log.json',
+              'user_data/ledger/seasons.json',
+              'user_data/ledger/quests.json',
+              'user_data/ledger/progress.json',
+              'user_data/ledger/progressions.json',
+              'user_data/ledger/challenge_v2.json',
+          ] + sorted(glob.glob('user_data/activities/workout_plans/sessions/*.json'))
+          bad = []
+          checked = 0
+          for f in files:
+              try:
+                  with open(f) as fh:
+                      json.load(fh)
+                  checked += 1
+              except FileNotFoundError:
+                  continue
+              except json.JSONDecodeError as e:
+                  bad.append(f"{f}: {e}")
+
+          if bad:
+              print("::error::Invalid JSON — a direct push to main with this would break the dashboard build:")
+              for b in bad:
+                  print(f"  - {b}")
+              sys.exit(1)
+          print(f"Validated {checked} JSON file(s) — all parse cleanly.")
+          PY
+
+      - name: Validate current-schema coach/ledger files shape
+        run: |
+          python3 - <<'PY'
+          import json, sys
+
+          # Required top-level keys per file - matches the live TypeScript interfaces in
+          # ui/api/coach-chat/_lib/coachMemoryFiles.ts and coachQuestFiles.ts, which are the
+          # source of truth for shape. This is a CI smoke check (catch a malformed/truncated
+          # write before it breaks the deploy), not a full schema linter - that's
+          # parseCurrentWeek's job for current_week.json, and there's no equivalent strict
+          # parser for these files yet.
+          REQUIRED_KEYS = {
+              "user_data/coach/profile.json": ["version", "coach_since", "name", "timezone"],
+              "user_data/coach/memory.json": ["version", "_meta", "sports", "coaching_style", "notes"],
+              "user_data/coach/injuries.json": ["flags"],
+              "user_data/coach/coach_log.json": ["version", "rows"],
+              "user_data/ledger/seasons.json": ["version", "_meta", "current_season_id", "seasons"],
+              "user_data/ledger/quests.json": ["version", "_meta", "weekly_targets", "main_quest", "quests"],
+              "user_data/ledger/progress.json": ["version", "rows"],
+              "user_data/ledger/progressions.json": ["version", "_meta", "progressions"],
+          }
+
+          errors = []
+          checked = 0
+          for path, required in REQUIRED_KEYS.items():
+              try:
+                  with open(path) as fh:
+                      data = json.load(fh)
+              except FileNotFoundError:
+                  continue
+              except json.JSONDecodeError:
+                  continue  # already caught by the JSON-parse step above
+
+              if not isinstance(data, dict):
+                  errors.append(f"{path}: must be a JSON object")
+                  continue
+              missing = [k for k in required if k not in data]
+              if missing:
+                  errors.append(f"{path}: missing required key(s): {', '.join(missing)}")
+              checked += 1
+
+          if errors:
+              print("::error::Coach/ledger file(s) missing required schema keys:")
+              for e in errors:
+                  print(f"  - {e}")
+              sys.exit(1)
+          print(f"Validated {checked} current-schema file(s) — required keys present.")
+          PY
+
+      - name: Validate legacy challenge_v2.json shape
+        run: |
+          python3 - <<'PY'
+          import json, sys
+
+          path = "user_data/ledger/challenge_v2.json"
+          try:
+              with open(path) as fh:
+                  data = json.load(fh)
+          except FileNotFoundError:
+              print(f"::notice::{path} not found — skipping legacy shape check (repo is on the current schema)")
+              sys.exit(0)
+          except json.JSONDecodeError:
+              sys.exit(0)  # already caught by the JSON-parse step above
+
+          errors = []
+          if data.get("version") != 4:
+              errors.append(f"version must be 4 (ADR 0006), got {data.get('version')!r}")
+          if "challenge" in data:
+              errors.append("legacy top-level 'challenge' block found — use 'season' (v4)")
+          if "season" not in data:
+              errors.append("missing required 'season' block")
+          if "main_quest" not in data:
+              errors.append("missing required 'main_quest' block")
+          if "quests" not in data:
+              errors.append("missing required 'quests' list")
+
+          weekly_targets = data.get("weekly_targets")
+          if weekly_targets is not None:
+              bad_keys = [k for k, v in weekly_targets.items() if not isinstance(v, (int, float))]
+              if bad_keys:
+                  errors.append(
+                      f"weekly_targets must be plain numbers, not config objects: {', '.join(bad_keys)}"
+                  )
+
+          for i, q in enumerate(data.get("quests", []) or []):
+              if not isinstance(q, dict) or q.get("type") != "daily_streak":
+                  continue
+              prefix = f"quests[{i}] ({q.get('id', '?')})"
+              polarity = q.get("polarity", "default_not_done")
+              required_fields = ["excused_dates"]
+              required_fields.append("missed_dates" if polarity == "default_done" else "completed_dates")
+              for field in required_fields:
+                  value = q.get(field)
+                  if value is None:
+                      errors.append(f"{prefix} missing required field: {field} (use [] if empty)")
+                  elif not isinstance(value, list):
+                      errors.append(f"{prefix} {field} must be an array")
+
+          if errors:
+              print(f"::error::{path} does not match the canonical v4 schema:")
+              for e in errors:
+                  print(f"  - {e}")
+              sys.exit(1)
+          print(f"Validated {path} — v4 shape OK.")
+          PY
+
+      - name: Validate widget_snapshots.json
+        run: |
+          python3 - <<'PY'
+          import json, sys
+
+          path = "gen/widget_snapshots.json"
+          try:
+              with open(path) as fh:
+                  data = json.load(fh)
+          except FileNotFoundError:
+              print(f"::error::{path} not found")
+              sys.exit(1)
+          except json.JSONDecodeError as e:
+              print(f"::error::{path}: {e}")
+              sys.exit(1)
+
+          required = ("schema_version", "generated_at", "home")
+          missing = [k for k in required if k not in data]
+          if missing:
+              print(f"::error::{path} missing required keys: {', '.join(missing)}")
+              sys.exit(1)
+
+          if data["schema_version"] != 1:
+              print(f"::error::{path} schema_version must be 1, got {data['schema_version']!r}")
+              sys.exit(1)
+
+          print(f"Validated {path} — schema_version=1, required keys present.")
+          PY

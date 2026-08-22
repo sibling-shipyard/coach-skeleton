@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Generate quest_history.json from all season archives.
+
+Reads seasons/*/challenge_v2.json (sorted by start_date) then
+ledger/challenge_v2.json (current season). For each daily_streak quest,
+reconstructs per-day status from polarity + date arrays and writes a unified
+flat file the dashboard can read without being season-aware.
+
+Output path:
+  - QUEST_HISTORY_OUTPUT env var if set
+  - gen/quest_history.json (new layout) or training/activities/quest_history.json (legacy)
+
+Status values: "done", "missed", "excused"
+Gaps (e.g., Jun 7-17 between seasons) are omitted — no entry means no data.
+
+Each quest also carries start_date (earliest seen across every season) and end_date (null while
+still active - i.e. present in the current/live season - otherwise the date it was last
+processed through) so a consumer can tell a still-open quest from a retired one without scanning
+entries.
+
+Usage:
+  python3 scripts/generate_quest_history.py
+"""
+
+import json
+import os
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
+_here = Path(__file__).resolve().parent
+sys.path.insert(0, str(_here.parent / "lib"))
+from repo_layout import ledger_dir, quest_history_path, repo_root_from_here, seasons_dir  # noqa: E402
+from challenge_schema import challenge_window, season_start_date  # noqa: E402
+from timezone_util import resolve_athlete_timezone, today_in_timezone  # noqa: E402
+
+REPO_DIR = repo_root_from_here(__file__)
+TODAY = today_in_timezone(resolve_athlete_timezone(REPO_DIR))
+
+
+def resolve_output_path() -> Path:
+    override = os.environ.get("QUEST_HISTORY_OUTPUT")
+    if override:
+        return Path(override)
+    return quest_history_path(REPO_DIR)
+
+
+def date_range(start: str, end: str):
+    d = date.fromisoformat(start)
+    e = date.fromisoformat(end)
+    while d <= e:
+        yield d.isoformat()
+        d += timedelta(days=1)
+
+
+def process_season(data: dict, is_current: bool, quests_out: dict) -> None:
+    """Appends this season's daily_streak quest entries into quests_out.
+
+    A quest tracked continuously across a season transition (same id, same start_date carried
+    forward rather than reset) means the just-archived season and the new live season can cover
+    an overlapping date range - the transition renames the season/phase without giving the quest
+    a fresh start_date. quests_out[qid]["entries"] is keyed by date (not a plain list) during
+    processing specifically to absorb that overlap: a later-processed season's status for a date
+    wins over an earlier one's (archives are processed in start_date order, current season last,
+    so "later" here means "more current" - the live season's status for a shared date is more
+    likely to reflect any post-hoc correction than the frozen archive's).
+    """
+    season_end = challenge_window(data)["end_date"]
+
+    for quest in data.get("quests", []):
+        if quest.get("type") != "daily_streak":
+            continue
+
+        qid = quest["id"]
+        qname = quest["name"]
+        # default_not_done is the schema-wide default (unified challenge_v2 shape) - must match
+        # renderQuestContext and warmHomeSnapshots.ts's buildQuestSnapshot, which both default
+        # an absent polarity the same way.
+        polarity = quest.get("polarity", "default_not_done")
+        start = quest["start_date"]
+
+        missed = set(quest.get("missed_dates", []))
+        excused = set(quest.get("excused_dates", []))
+        completed = set(quest.get("completed_dates", []))
+
+        if is_current:
+            end = TODAY.isoformat()
+        else:
+            # Cap at the last date actually logged — no fake entries after tracking stopped
+            all_logged = missed | excused | completed
+            if not all_logged:
+                continue
+            end = max(all_logged)
+
+        if qid not in quests_out:
+            quests_out[qid] = {"name": qname, "start_date": start, "end_date": None, "entries": {}}
+
+        # start_date: earliest seen across every season processed for this id. end_date: null
+        # while the quest is still active (seen in the current/live season), otherwise the last
+        # date it was actually processed through. Seasons are processed oldest-first, current
+        # season last (see main()), so a quest's current-season write - when there is one - is
+        # always the final one for that id, which is what makes "just overwrite end_date on every
+        # call" correct: a still-active quest ends up null, a fully-retired one ends up with its
+        # real closing date, no separate bookkeeping needed.
+        quests_out[qid]["start_date"] = min(quests_out[qid]["start_date"], start)
+        quests_out[qid]["end_date"] = None if is_current else end
+
+        for d in date_range(start, end):
+            if polarity == "default_done":
+                if d in excused:
+                    status = "excused"
+                elif d in missed:
+                    status = "missed"
+                else:
+                    status = "done"
+            else:  # default_not_done
+                if d in excused:
+                    status = "excused"
+                elif d in completed:
+                    status = "done"
+                else:
+                    status = "missed"
+
+            quests_out[qid]["entries"][d] = status
+
+
+def main():
+    quests_out: dict = {}
+
+    # Archive seasons sorted by start_date
+    seasons = seasons_dir(REPO_DIR)
+    archive_files = sorted(
+        seasons.glob("*/challenge_v2.json") if seasons.exists() else [],
+        key=lambda f: season_start_date(json.loads(f.read_text())),
+    )
+    for path in archive_files:
+        data = json.loads(path.read_text())
+        process_season(data, is_current=False, quests_out=quests_out)
+
+    # Current season
+    current_path = ledger_dir(REPO_DIR) / "challenge_v2.json"
+    if current_path.exists():
+        data = json.loads(current_path.read_text())
+        process_season(data, is_current=True, quests_out=quests_out)
+
+    # Flatten each quest's date-keyed dict (built that way to absorb season-transition overlap,
+    # see process_season's docstring) into the sorted {date, status} list format the rest of the
+    # pipeline (and QuestSummaryCard's monthKey prefix filter) expects.
+    for quest in quests_out.values():
+        quest["entries"] = [
+            {"date": d, "status": status} for d, status in sorted(quest["entries"].items())
+        ]
+
+    output = {
+        "generated_at": TODAY.isoformat(),
+        "quests": quests_out,
+    }
+
+    output_path = resolve_output_path()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(output, indent=2) + "\n")
+    print(f"[quest-history] wrote {output_path}", file=sys.stderr)
+    for qid, q in quests_out.items():
+        print(f"[quest-history]   {qid}: {len(q['entries'])} entries", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

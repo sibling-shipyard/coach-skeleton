@@ -1,0 +1,7 @@
+.env
+.env.local
+user_data/activities/hist/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
