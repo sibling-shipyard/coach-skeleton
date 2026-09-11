@@ -1,0 +1,116 @@
+# User-repo sync (coach-skeleton / coach-<user>). iOS path only — the HealthKit app commits
+# history directly, this just regenerates derived files (quest_history, sync_status,
+# dashboard_snapshot, athlete_insights) on every push.
+
+name: Sync
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'user_data/activities/hist/**'
+      - 'user_data/ledger/**'
+      - 'user_data/coach/sleep_log.json'
+
+permissions:
+  contents: write
+
+# Serialize runs so two Sync jobs never race each other's push to main.
+# cancel-in-progress:false — let an in-flight regen finish; queue the next.
+concurrency:
+  group: sync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install requests
+
+      - name: Find changed activities
+        if: github.event_name == 'push'
+        run: |
+          {
+            echo 'CHANGED_ACTIVITY_PATHS<<EOF'
+            git diff --name-only --diff-filter=AM '${{ github.event.before }}' '${{ github.sha }}' -- user_data/activities/hist/ || true
+            echo EOF
+          } >> "$GITHUB_ENV"
+
+      - name: Run pipeline
+        run: python3 engine/scripts/regenerate_derived.py
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build dashboard snapshot and athlete insights
+        run: |
+          node engine/scripts/build-dashboard-snapshot.mjs --dashboard-snapshot
+          node engine/scripts/generate-athlete-insights.mjs
+
+      - name: Commit pipeline changes
+        run: |
+          # Stage the athlete's activity history. Two states break a plain `git add` here and
+          # they need different handling, which is why this is a function and not one flag:
+          #   - the carved .gitignore lists user_data/activities/hist/, so a file sitting there
+          #     untracked is refused (exit 1) without -f;
+          #   - on a fresh carve the directory does not exist at all, and `git add` on a missing
+          #     pathspec is a fatal 128 that -f does not change.
+          # Real history arrives already tracked: iOS commits it through the Git Data API, which
+          # does not consult .gitignore. So this stages the same files it always did.
+          add_history() {
+            hist=user_data/activities/hist
+            [ -d "$hist" ] || return 0
+            [ -n "$(ls -A "$hist" 2>/dev/null)" ] || return 0
+            git add -f "$hist/"
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          add_history
+          git add -f gen/dashboard_snapshot.json gen/athlete_insights.json
+          git add gen/quest_history.json gen/sync_status.json
+          if git diff --cached --quiet; then
+            echo "No changes"
+            exit 0
+          fi
+          MSG=$(python3 -c "import json; print(json.load(open('gen/sync_status.json'))['commit_message'])" 2>/dev/null || echo "core: regenerate derived data [skip ci]")
+          git commit -m "$MSG"
+          # Retry loop: on non-fast-forward, reset to origin/main and re-run the full
+          # pipeline rather than rebasing — gen files are deterministic from activity
+          # data, so regenerating on the new HEAD always produces a conflict-free commit.
+          for attempt in 1 2 3; do
+            git push && exit 0
+            echo "push rejected — re-running pipeline on origin/main (attempt $attempt)"
+            git fetch origin main
+            git reset --hard origin/main
+            python3 engine/scripts/regenerate_derived.py
+            add_history
+            node engine/scripts/build-dashboard-snapshot.mjs --dashboard-snapshot
+            node engine/scripts/generate-athlete-insights.mjs
+            git add -f gen/dashboard_snapshot.json gen/athlete_insights.json
+            git add gen/quest_history.json gen/sync_status.json
+            if git diff --cached --quiet; then
+              echo "No changes after re-run"
+              exit 0
+            fi
+            MSG=$(python3 -c "import json; print(json.load(open('gen/sync_status.json'))['commit_message'])" 2>/dev/null || echo "core: regenerate derived data [skip ci]")
+            git commit -m "$MSG"
+          done
+          echo "All push attempts failed"
+          exit 1
